@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+*.keystore
+*.keystore.json
+*-keystore.json
+*-password
+*.secret
+*.pem
+*.key
+
+# Runtime data
+data/
+*.pid
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
