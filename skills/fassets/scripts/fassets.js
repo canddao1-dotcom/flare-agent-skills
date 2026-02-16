@@ -258,7 +258,7 @@ async function mint(args) {
     const acctInfo = await client.request({ command: 'account_info', account: xrplAddress });
     xrpBalance = Number(xrpl.dropsToXrp(acctInfo.result.account_data.Balance));
     console.log(`\n  XRPL Balance: ${xrpBalance} XRP`);
-    const available = xrpBalance - 10; // 10 XRP reserve
+    const available = xrpBalance - 1; // 1 XRP base reserve (XRPL reduced from 10)
     console.log(`  Available (minus reserve): ${available.toFixed(6)} XRP`);
     if (available < totalXRP) {
       await client.disconnect();
@@ -267,7 +267,7 @@ async function mint(args) {
   } catch (e) {
     if (e.data?.error === 'actNotFound') {
       await client.disconnect();
-      throw new Error('XRPL account not activated. Need at least 10 XRP + minting amount');
+      throw new Error('XRPL account not activated. Need at least 1 XRP reserve + minting amount');
     }
     if (e.message?.includes('Insufficient')) throw e;
   }
