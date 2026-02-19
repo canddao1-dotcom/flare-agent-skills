@@ -1,6 +1,6 @@
 # Flare Agent Skills
 
-A collection of DeFi skills for AI agents operating on Flare Network. Built for use with [OpenClaw](https://openclaw.ai) and [FlareBank](https://flarebank.io).
+A collection of DeFi skills for AI agents operating on Flare Network. Built for use with [OpenClaw](https://openclaw.ai) and [FlareBank]([flrbank.com](https://www.flrbank.com/)).
 
 ## Install
 
