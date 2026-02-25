@@ -67,7 +67,7 @@ These aliases are automatically resolved:
 
 - **On-chain only** - no external APIs
 - **FtsoV2 Contract** - official Flare oracle
-- **~3 second updates** - near real-time prices
+- **~90 second updates** - prices update each voting epoch
 
 ## Historical Data
 
