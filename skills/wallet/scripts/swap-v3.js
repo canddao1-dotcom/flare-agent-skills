@@ -58,6 +58,14 @@ const FACTORY_ABI = [
 // Enosys V3 Factory
 const ENOSYS_FACTORY = '0x17AA157AC8C54034381b840Cb8f6bf7Fc355f0de';
 
+// Enosys QuoterV2 — simulates swaps on-chain for accurate quotes
+const QUOTER_V2 = '0xE505Bf33e84dDA2183cd0E4a6E8B084b85BC4269';
+
+// Load QuoterV2 ABI from repo
+const QUOTER_V2_ABI = JSON.parse(
+  fs.readFileSync(require('path').join(__dirname, '..', 'abi', 'QuoterV2.json'), 'utf8')
+);
+
 /**
  * Get pool address from factory
  */
@@ -67,94 +75,41 @@ async function getPool(provider, tokenA, tokenB, fee = 3000) {
 }
 
 /**
- * Get quote by simulating against pool using tick-based calculation
- * 
- * ⚠️ WARNING: For low-liquidity pools, this estimate can be significantly wrong!
- * For accurate quotes, use on-chain QuoterV2 contract.
+ * Naive fallback quote using sqrtPriceX96 — INACCURATE, used only when QuoterV2 fails.
  */
-async function getQuote(provider, tokenIn, tokenOut, amountIn, fee = 3000) {
+async function getNaiveQuote(provider, tokenIn, tokenOut, amountIn, fee = 3000) {
   const poolAddress = await getPool(provider, tokenIn, tokenOut, fee);
-  
-  if (poolAddress === ethers.ZeroAddress) {
-    return null;
-  }
-  
+  if (poolAddress === ethers.ZeroAddress) return null;
+
   const pool = new ethers.Contract(poolAddress, POOL_ABI, provider);
   const [slot0, token0, liquidity] = await Promise.all([
     pool.slot0(),
     pool.token0(),
     pool.liquidity()
   ]);
-  
+
   const sqrtPriceX96 = slot0[0];
   const currentTick = Number(slot0[1]);
   const L = BigInt(liquidity.toString());
   const isToken0 = tokenIn.toLowerCase() === token0.toLowerCase();
   const Q96 = BigInt(2) ** BigInt(96);
-  
-  // Fee deduction (e.g., 3000 = 0.3%)
+
   const feeMultiplier = BigInt(1000000 - fee);
   const amountInAfterFee = BigInt(amountIn.toString()) * feeMultiplier / BigInt(1000000);
-  
-  // ⚠️ LOW LIQUIDITY WARNING
-  // Check if swap amount is significant relative to pool liquidity
-  const liquidityThreshold = L / BigInt(100); // 1% of liquidity
-  const isLowLiquidity = amountInAfterFee > liquidityThreshold;
-  
+
   let amountOut;
-  let warning = null;
-  
   if (L === BigInt(0)) {
-    // No liquidity in pool
-    warning = '⚠️ CRITICAL: Pool has ZERO liquidity!';
     amountOut = BigInt(0);
-  } else if (isLowLiquidity) {
-    // Low liquidity - use tick-based simulation
-    warning = '⚠️ WARNING: Low liquidity pool! Quote may be significantly inaccurate.';
-    
-    // For token1 -> token0 (zeroForOne = false, price goes UP):
-    // deltaSqrtPrice = deltaY * Q96 / L
-    // deltaX = L * Q96 / sqrtPriceAfter - L * Q96 / sqrtPriceBefore
-    
-    const sqrtP = BigInt(sqrtPriceX96.toString());
-    
-    if (!isToken0) {
-      // Selling token1 for token0
-      const deltaSqrtPrice = amountInAfterFee * Q96 / L;
-      const sqrtPriceAfter = sqrtP + deltaSqrtPrice;
-      
-      const xBefore = L * Q96 / sqrtP;
-      const xAfter = L * Q96 / sqrtPriceAfter;
-      amountOut = xBefore > xAfter ? xBefore - xAfter : BigInt(0);
-    } else {
-      // Selling token0 for token1
-      const deltaSqrtPrice = amountInAfterFee * Q96 / L;
-      const sqrtPriceAfter = sqrtP > deltaSqrtPrice ? sqrtP - deltaSqrtPrice : BigInt(1);
-      
-      const yBefore = L * sqrtP / Q96;
-      const yAfter = L * sqrtPriceAfter / Q96;
-      amountOut = yBefore > yAfter ? yBefore - yAfter : BigInt(0);
-    }
   } else {
-    // Normal liquidity - use naive price calculation (faster, accurate for small swaps)
     const price = Number(sqrtPriceX96) / Number(Q96);
     const priceSquared = price * price;
-    
     if (isToken0) {
       amountOut = BigInt(Math.floor(Number(amountInAfterFee) * priceSquared));
     } else {
       amountOut = BigInt(Math.floor(Number(amountInAfterFee) / priceSquared));
     }
   }
-  
-  // Log warning if applicable
-  if (warning) {
-    console.warn(warning);
-    console.warn(`   Pool: ${poolAddress}`);
-    console.warn(`   Liquidity: ${liquidity.toString()}`);
-    console.warn(`   Amount: ${amountIn.toString()}`);
-  }
-  
+
   return {
     amountOut,
     poolAddress,
@@ -162,23 +117,95 @@ async function getQuote(provider, tokenIn, tokenOut, amountIn, fee = 3000) {
     liquidity,
     fee,
     currentTick,
-    isLowLiquidity,
-    warning
+    isNaiveFallback: true,
+    warning: '⚠️ FALLBACK: Using naive price estimate — may be significantly inaccurate! QuoterV2 call failed.'
   };
 }
 
 /**
- * Get the best quote across all fee tiers
+ * Get accurate quote via on-chain QuoterV2 (simulates the actual swap).
+ * Falls back to naive calculation if QuoterV2 reverts.
+ */
+async function getQuote(provider, tokenIn, tokenOut, amountIn, fee = 3000) {
+  const quoter = new ethers.Contract(QUOTER_V2, QUOTER_V2_ABI, provider);
+
+  try {
+    const result = await quoter.quoteExactInputSingle.staticCall({
+      tokenIn,
+      tokenOut,
+      amountIn,
+      fee,
+      sqrtPriceLimitX96: 0,
+    });
+
+    const amountOut = result[0];
+    const sqrtPriceX96After = result[1];
+    const ticksCrossed = Number(result[2]);
+    const gasEstimate = result[3];
+
+    // Get pool info for liquidity warning
+    let poolAddress = ethers.ZeroAddress;
+    let liquidity = BigInt(0);
+    let warning = null;
+    try {
+      poolAddress = await getPool(provider, tokenIn, tokenOut, fee);
+      if (poolAddress !== ethers.ZeroAddress) {
+        const pool = new ethers.Contract(poolAddress, POOL_ABI, provider);
+        liquidity = await pool.liquidity();
+
+        // Liquidity warning: if swap crosses many ticks, liquidity may be thin
+        if (ticksCrossed > 10) {
+          warning = `⚠️ WARNING: Swap crosses ${ticksCrossed} ticks — high price impact likely.`;
+        }
+        // Also warn if amountOut is zero or very small
+        if (amountOut === BigInt(0)) {
+          warning = '⚠️ CRITICAL: Quote returned zero output — pool may lack liquidity at this price range.';
+        }
+      }
+    } catch (_) {
+      // Non-critical, pool info is for display only
+    }
+
+    if (warning) {
+      console.warn(warning);
+      console.warn(`   Pool: ${poolAddress}`);
+      console.warn(`   Ticks crossed: ${ticksCrossed}`);
+    }
+
+    return {
+      amountOut,
+      poolAddress,
+      sqrtPriceX96After,
+      liquidity,
+      fee,
+      ticksCrossed,
+      gasEstimate,
+      isNaiveFallback: false,
+      warning
+    };
+  } catch (err) {
+    // QuoterV2 failed (pool doesn't exist, no liquidity, etc.) — fall back to naive
+    console.warn(`⚠️ QuoterV2 call failed for fee=${fee}: ${err.message || err}`);
+    console.warn('   Falling back to naive price estimate — RESULTS MAY BE INACCURATE!');
+    return await getNaiveQuote(provider, tokenIn, tokenOut, amountIn, fee);
+  }
+}
+
+/**
+ * Get the best quote across all fee tiers using QuoterV2.
+ * Compares 0.05%, 0.3%, and 1% pools and returns the best output.
  */
 async function getBestQuote(provider, tokenIn, tokenOut, amountIn) {
   const fees = [500, 3000, 10000]; // 0.05%, 0.3%, 1%
   let bestQuote = null;
-  
+  const allQuotes = [];
+
   for (const fee of fees) {
     try {
       const quote = await getQuote(provider, tokenIn, tokenOut, amountIn, fee);
       if (!quote || quote.amountOut === BigInt(0)) continue;
-      
+      allQuotes.push(quote);
+
       if (!bestQuote || quote.amountOut > bestQuote.amountOut) {
         bestQuote = quote;
       }
@@ -186,7 +213,17 @@ async function getBestQuote(provider, tokenIn, tokenOut, amountIn) {
       // Pool doesn't exist or error, skip
     }
   }
-  
+
+  // Log comparison if multiple pools returned quotes
+  if (allQuotes.length > 1) {
+    console.log(`\n📊 Multi-pool comparison (${allQuotes.length} pools):`);
+    for (const q of allQuotes) {
+      const marker = q === bestQuote ? ' ← BEST' : '';
+      const fallbackTag = q.isNaiveFallback ? ' [NAIVE FALLBACK]' : '';
+      console.log(`   Fee ${q.fee/10000}%: amountOut=${q.amountOut.toString()}${fallbackTag}${marker}`);
+    }
+  }
+
   return bestQuote;
 }
 
@@ -355,17 +392,24 @@ Examples:
     ]);
     
     const amountIn = ethers.parseUnits(amount, decIn);
-    const quote = await getQuote(provider, tokenInAddr, tokenOutAddr, amountIn, fee);
+    
+    // If user specified a fee, use that pool; otherwise compare all pools
+    const userSpecifiedFee = args.includes('--fee');
+    const quote = userSpecifiedFee
+      ? await getQuote(provider, tokenInAddr, tokenOutAddr, amountIn, fee)
+      : await getBestQuote(provider, tokenInAddr, tokenOutAddr, amountIn);
     
     if (!quote) {
-      console.log(`❌ No pool found for ${fromToken}/${toToken} with fee ${fee}`);
+      console.log(`❌ No pool found for ${fromToken}/${toToken}${userSpecifiedFee ? ` with fee ${fee}` : ''}`);
       process.exit(1);
     }
     
-    console.log(`\n📊 Quote on Enosys V3`);
+    console.log(`\n📊 Quote on Enosys V3${quote.isNaiveFallback ? ' (⚠️ NAIVE FALLBACK)' : ' (QuoterV2)'}`);
     console.log(`   Pool: ${quote.poolAddress}`);
     console.log(`   ${amount} ${fromToken} → ~${ethers.formatUnits(quote.amountOut, decOut)} ${toToken}`);
-    console.log(`   Fee tier: ${fee/10000}%`);
+    console.log(`   Fee tier: ${quote.fee/10000}%`);
+    if (quote.ticksCrossed !== undefined) console.log(`   Ticks crossed: ${quote.ticksCrossed}`);
+    if (quote.isNaiveFallback) console.log(`   ${quote.warning}`);
     
   } else if (command === 'swap') {
     if (!keystorePath || !fromToken || !toToken || !amount) {
